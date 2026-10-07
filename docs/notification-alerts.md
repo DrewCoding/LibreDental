@@ -1,7 +1,7 @@
 # Appointment Reminders (Email and SMS)
 
-> **Status:** in progress (branch `sms-notif`). PR 1 (system actor) is implemented; PRs 2 to 4
-> are planned. Last updated 2026-10-05.
+> **Status:** in progress (branch `sms-notif`). PR 1 (system actor) and PR 2 (email and SMS
+> providers) are implemented; PRs 3 and 4 are planned. Last updated 2026-10-05.
 
 LibreDental will send automatic appointment reminders to patients by email and text message.
 This document records the design decisions, the research behind them, and how the feature
@@ -231,7 +231,7 @@ Sizes are rough estimates to help reviewers plan, not commitments.
 | PR | Scope | Schema change | Est. size (code / tests) |
 | --- | --- | --- | --- |
 | 1 | System actor | None | ~80 / ~150 lines |
-| 2 | Email and SMS providers, send test | None | ~450 / ~600 lines |
+| 2 | Email and SMS providers, send test | None | ~550 / ~750 lines |
 | 3 | Automatic reminders | Yes, additive | ~1,100 / ~1,000 lines |
 | 4 | Optional Terraform module | None | ~250 HCL / ~80 lines |
 
@@ -267,55 +267,331 @@ uses the external `services_test` package.
 `go vet ./internal/...`. Both new guard tests were checked by disabling the check they cover:
 each failed, then passed again once the check was restored.
 
-**Manual (still to do):** with `task desktop`, open Audit and check that staff entries look
-the same as before. There are no system entries to see until PR 3.
+**Manual (done):** with `task desktop`, the Audit view shows staff entries the same as before.
+There are no system entries to see until PR 3.
 
-### PR 2: Email and SMS providers
+### PR 2: Email and SMS providers (implemented)
 
-**New dependency:** `github.com/aws/aws-sdk-go-v2` with only the `aws`, `credentials`, and
-`service/pinpointsmsvoicev2` modules. The SDK's `config` package is deliberately not used:
-its default credential chain reads `~/.aws` and environment variables, which would let the app
-silently send with a developer's CLI credentials. The provider only uses the keys saved in the
-app.
+This section starts with the research behind the providers and then gives the plan. The
+research changed the plan in several places; those changes are called out.
+
+#### Research: email over SMTP
+
+**Library: Go's standard `net/smtp`, with the connection managed by us.** `net/smtp` is
+frozen (it gets no new features) and has no context support, but a plain-text reminder needs
+nothing it lacks. To get timeouts and enforce TLS, the provider dials the connection itself,
+sets a deadline from the context, and hands it to `smtp.NewClient`. Its `PlainAuth` refuses to
+send a password over a connection without TLS (fixed after CVE-2017-15042). A third-party
+library such as `wneessen/go-mail` would add OAuth2 and context support; it can be revisited
+if OAuth2 becomes necessary (see Microsoft 365 below).
+
+**TLS for the whole session, not just authentication.** `smtp.SendMail` only upgrades to TLS
+if the server offers it, so a man-in-the-middle could strip STARTTLS and receive patient
+data in plain text. The provider instead:
+
+- in `starttls` mode (ports 587, 2587), fails if the server doesn't offer STARTTLS;
+- in `implicit` mode (ports 465, 2465), connects with TLS from the start;
+- requires TLS 1.2 or newer and verifies the server certificate against the configured host;
+- has no "no TLS" mode at all.
+
+**What the email hosts require:**
+
+| Host | Works with this provider? | Notes |
+| --- | --- | --- |
+| Amazon SES | Yes | Endpoint `email-smtp.<region>.amazonaws.com`. STARTTLS on 25, 587, 2587; implicit TLS on 465, 2465. All connections must use TLS. **SMTP credentials are not the IAM access key:** they're generated in the SES console (or derived from an IAM user's secret key), are specific to one region, and need the `ses:SendRawEmail` permission. Don't derive them from temporary credentials. |
+| Google Workspace / Gmail | Yes, with an app password | Google ended plain-password SMTP sign-in in May 2025. App passwords still work; Google prefers OAuth2. |
+| Microsoft 365 | **Not targeted** | Microsoft disables basic authentication for SMTP AUTH at the end of December 2026. Tenants can turn it back on temporarily, and a final removal date comes in the second half of 2027. Supporting Microsoft 365 properly means OAuth2, which is future work. |
+| Other hosts (Mailgun, Postmark, a practice's own server) | Yes, if they offer TLS and `AUTH PLAIN` | |
+
+**Message format.** Plain text only: `Content-Type: text/plain; charset=UTF-8` with
+quoted-printable encoding. The subject is encoded with `mime.QEncoding`, and addresses are
+parsed and formatted with `net/mail`. Headers: `From`, `To`, `Subject`, `Date`, `Message-ID`,
+`MIME-Version`. Any CR or LF in the subject, sender name, or addresses is rejected, which
+blocks header injection even though the encoders would also catch it.
+
+**Message ID.** `net/smtp` doesn't expose the server's reply to the end of the message, so
+SES's own message ID can't be read. The provider generates the `Message-ID` header itself
+(random, at the sender's domain) and records that as the external message ID. It also
+appears in bounce messages, so bounces can be matched to the log later.
+
+**"Sent" means "accepted by the server".** SMTP has no delivery confirmation; bounces arrive
+later. The log status reflects acceptance only.
+
+**Deliverability.** Gmail, Yahoo, and Outlook require every sender to pass SPF or DKIM and to
+use TLS. Senders of more than 5,000 messages a day to their users must also have DMARC and
+one-click unsubscribe. A dental practice is far below that, but setup docs will still
+recommend SPF, DKIM, and DMARC for the sending domain (for SES: a verified domain identity
+with Easy DKIM and a custom MAIL FROM domain).
+
+**Encryption beyond SES.** TLS to SES protects the first hop. SES then delivers to the
+patient's mail server with TLS when that server supports it. An SES configuration set with
+TLS policy "Require" bounces mail rather than sending it unencrypted; making that the
+identity's default configuration set applies it without any app change. That belongs in the
+setup docs and the PR 4 Terraform module.
+
+#### Research: SMS through AWS End User Messaging
+
+**SDK modules.** `aws-sdk-go-v2` with only `aws`, `credentials`, and
+`service/pinpointsmsvoicev2`. The client is built directly with `pinpointsmsvoicev2.New` and
+static credentials from the keychain. The SDK's `config` package is not used, so the app can
+never pick up `~/.aws` or environment credentials.
+
+**No automatic retries.** `SendTextMessage` has no idempotency token: AWS's API model lists no
+client token parameter. The SDK's default retryer makes up to 3 attempts, including after
+`InternalServerException` (HTTP 500) and network timeouts, when the first attempt may already
+have sent the text. So the client uses `aws.NopRetryer`, which makes exactly one attempt. Any
+retry is decided later by the reminder job (PR 3), which knows whether a retry is safe.
+
+**Request fields used:**
+
+| Field | Value |
+| --- | --- |
+| `DestinationPhoneNumber` | The patient's number in E.164 (`+` and up to 15 digits). |
+| `OriginationIdentity` | From config: phone number, phone number ID or ARN, or pool ID or ARN. |
+| `MessageBody` | The rendered message. |
+| `MessageType` | `TRANSACTIONAL` (time-sensitive), never `PROMOTIONAL`. |
+| `ConfigurationSetName` | Optional, from config. Enables delivery events later. |
+| `TimeToLive` | Not set in PR 2 (AWS default is 72 hours). PR 3 sets it so a reminder that can't be handed to the carrier in time expires instead of arriving after the appointment. |
+| `Context` | Not set in PR 2. PR 3 can pass the `notification_log` ID (no patient data) so delivery events can be matched to the log. |
+| `DryRun` | Used by the opt-in live test. AWS validates the request without sending it, at no charge. |
+
+**Message length.** A message part holds 160 characters in GSM-7 or 70 in UCS-2 (153 or 67
+in multipart messages). One character outside GSM-7, such as a curly apostrophe `’` from a
+word processor, switches the whole message to UCS-2. `^ { } \ [ ] ~ | €` count as two
+characters. AWS's maximum is 1,530 GSM-7 or 630 UCS-2 characters, and each part is billed.
+The provider counts parts before sending and rejects messages over the maximum with a clear
+error. PR 3's template editor reuses the same counter.
+
+**Errors.** Every `SendTextMessage` error is HTTP 400 except `InternalServerException` (500).
+The provider maps the reason codes from AWS's API model into readable failures:
+
+| AWS error | Reason | Meaning for the practice |
+| --- | --- | --- |
+| `ConflictException` | `DESTINATION_PHONE_NUMBER_OPTED_OUT` | The patient replied STOP. |
+| `ConflictException` | `DESTINATION_PHONE_NUMBER_NOT_VERIFIED` | Account is in the SMS sandbox and the number isn't verified. |
+| `ServiceQuotaExceededException` | `MONTHLY_SPEND_LIMIT_REACHED_FOR_TEXT` | The account's SMS spend limit is used up. |
+| `AccessDeniedException` | `ACCOUNT_DISABLED`, `INSUFFICIENT_ACCOUNT_REPUTATION` | AWS has restricted the account. |
+| `ValidationException` | for example `DESTINATION_COUNTRY_BLOCKED`, `INVALID_IDENTITY_FOR_DESTINATION_COUNTRY`, `CANNOT_PARSE` | Configuration or number problem; the reason is shown. |
+| `ResourceNotFoundException` | | The origination identity or configuration set doesn't exist in that region. |
+| `ThrottlingException` | | Too many requests; not sent. |
+| `InternalServerException` or a network error after the request was sent | | **Outcome unknown**; the text may have been sent. |
+
+**"Not sent" versus "unknown".** Duplicate prevention in PR 3 needs to know whether a failed
+attempt might have reached the patient. Both providers therefore classify failures:
+
+- **Not sent:** rejected before the message could go out. For SMS, any 400 error; for SMTP,
+  any failure before the end of the message data (connection, TLS, authentication, rejected
+  sender or recipient).
+- **Unknown:** the request may have been delivered. For SMS, a 500 error or a timeout after
+  sending; for SMTP, no reply after the message data was sent.
+
+A new sentinel error, `domain.ErrDeliveryUnknown`, marks the second case. In PR 2 both cases
+are logged as `failed`, with the reason. PR 3 uses the distinction to leave unknown sends for
+staff to review instead of retrying them.
+
+#### Research: phone numbers
+
+`patients.phone_primary` is free text, and AWS needs E.164. LibreDental supports six
+countries: US and CA (both +1, no trunk prefix), and GB, AU, DE, and FR (national numbers
+start with a trunk `0` that's dropped after the country code). Numbers already starting with
+`+`, or with an international prefix (`00`, or `011` from US and CA), are taken as
+international.
+
+Two ways to normalize:
+
+| Option | For | Against |
+| --- | --- | --- |
+| `nyaruka/phonenumbers` (Go port of Google's libphonenumber) | Uses the same per-country rules as Android and most messaging platforms. Validates real number ranges. In GB, AU, DE, and FR it can tell mobile numbers from landlines, so the app can skip texting a landline. | A new dependency with embedded metadata, which makes the binary bigger (to be measured). US and CA numbers can't be classified as mobile or landline. |
+| Small hand-written function for the six countries | No dependency; easy to read and review. | Only checks length and prefixes, so it accepts numbers that don't exist; no landline detection. Each new country needs new rules. |
+
+Either way the function **refuses to guess**: anything it can't normalize is rejected with a
+clear message rather than sent to a possibly wrong number. **Chosen:** `nyaruka/phonenumbers`
+(see [Outcome](#outcome) for its measured cost).
+
+#### Plan
+
+**New dependencies:** the three AWS SDK modules above, and possibly `nyaruka/phonenumbers`.
 
 **Modified**
 
 | File | Change |
 | --- | --- |
-| `internal/services/secrets_service.go` | Redact every secret field, not only `api_key`: also `password` (SMTP) and `secret_access_key` (AWS). Restore each from the keychain when the frontend sends back the placeholder. Today an SMTP password or AWS secret would go to the frontend in plain text. |
-| `internal/services/notification_service.go` | Add `SendTestMessage(token, providerName, to, subject, body)`: token-gated, sends to an address staff type in (not a patient), and audited with `LogAction`. It writes no `notification_log` row, because that table requires a patient. For SMS, `recipientFor` normalizes the patient's phone to E.164 using the practice's country, so the constructor also takes the practice config repository. |
+| `internal/domain/notification.go` | Add `ErrDeliveryUnknown`. |
+| `internal/services/secrets_service.go` | Redact every secret field, not only `api_key`: also `password` (SMTP) and `secret_access_key` (AWS). Restore each from the keychain when the frontend sends back the placeholder. Without this, an SMTP password or AWS secret key would go back to the frontend in plain text. |
+| `internal/services/notification_service.go` | Add `SendTestMessage(token, providerName, to, subject, body)`: requires a session, sends to an address staff type in (not a patient), and is audited with `LogAction`. It writes no `notification_log` row, because that table requires a patient. For SMS, `recipientFor` normalizes the patient's phone to E.164 using the practice's country, so the constructor also takes the practice config repository. |
+| `internal/services/notification_service_test.go` | Constructor change; new tests below. |
 | `main.go` | Register the two providers. Pass the practice config repository to `NewNotificationService`. |
-| `frontend/src/views/clinic/IntegrationsSection.svelte` | The notification panel shows each provider's own fields instead of a single API key field. Secret fields use password inputs and keep the redaction placeholder. Add a "Send test" form. |
+| `frontend/src/views/clinic/IntegrationsSection.svelte` | The notification panel shows each provider's own fields instead of a single API key field. The claims panel is unchanged. Secret fields use password inputs and keep the redaction placeholder. Add a "Send test" form. |
 | `frontend/messages/en.json` | Field labels, help text, test-send messages. |
-| `go.mod`, `go.sum` | AWS SDK modules. |
+| `go.mod`, `go.sum` | New dependencies. |
 
 **Added**
 
 | File | Contents |
 | --- | --- |
-| `internal/services/notification_provider_smtp.go` | `smtp_email` provider. Config: `host`, `port`, `username`, `password`, `from_address`, `from_name`, `tls_mode` (`starttls` or `implicit`). Builds an RFC 5322 message (encoded subject, `Date`, `Message-ID`, CRLF line endings). Never sends credentials without TLS. |
-| `internal/services/notification_provider_aws_sms.go` | `aws_sms` provider. Config: `access_key_id`, `secret_access_key`, `region`, `origination_identity`, optional `configuration_set`. Calls `SendTextMessage` with message type `TRANSACTIONAL`. Maps AWS errors (for example a destination on the opt-out list) to readable failure messages. |
-| `internal/services/notification_phone.go` | `toE164(raw, country)`: normalizes free-text phone numbers. Rejects anything it can't normalize instead of guessing. |
-| `*_test.go` for each of the three files above | See below. |
+| `internal/services/notification_provider_smtp.go` | `smtp_email` provider. Config: `host`, `port`, `username`, `password`, `from_address`, `from_name`, `tls_mode` (`starttls` or `implicit`). |
+| `internal/services/notification_provider_aws_sms.go` | `aws_sms` provider. Config: `access_key_id`, `secret_access_key`, `region`, `origination_identity`, optional `configuration_set`. |
+| `internal/services/notification_sms.go` | SMS part counter (GSM-7 or UCS-2, number of parts) used by the AWS provider and later by PR 3. |
+| `internal/services/notification_phone.go` | `toE164(raw, country)`. |
+| A `_test.go` for each of the four files above | See below. |
 
 **Tests**
 
 | Test | Checks |
 | --- | --- |
-| SMTP message building (new) | Headers, non-ASCII subject encoding, CRLF line endings, a body line starting with `.`. |
-| SMTP transport (new) | An in-process fake SMTP server with a test TLS certificate. Covers a successful send, the server rejecting a recipient, bad credentials, and the provider refusing to authenticate when the server doesn't offer TLS. |
-| SMTP config (new) | Missing or invalid `host`, `port`, `from_address`, `tls_mode` are reported before connecting. |
-| AWS request shape (new) | An `httptest` server is set as the SDK endpoint. The request has the right `X-Amz-Target`, a SigV4 `Authorization` header, and the expected JSON fields. |
-| AWS responses (new) | Replays AWS's documented success and error responses: message ID stored; validation, throttling, and opt-out errors become failed results with a clear message. |
-| AWS config (new) | Missing keys or region fail before any request. No fallback to environment or `~/.aws` credentials (checked with those variables set). |
-| `toE164` table test (new) | US formats with and without `+1`, spaces, dashes, parentheses, extensions, too short or long, non-US numbers. |
-| Secrets redaction (extended) | Each secret field is redacted on read and restored on save; non-secret fields pass through. |
-| `SendTestMessage` (new) | Requires a session; audited on success and failure. |
-| `TestAWSSMSLive` (new, opt-in) | Skipped unless `AWS_SMS_LIVE_TEST=1` and credentials are set. Sends from a simulator origination number to a simulator destination number. CI never runs it. |
+| SMTP message building | Headers present and well-formed; non-ASCII subject and sender name encoded; quoted-printable body; CRLF line endings; a body line starting with `.`; CR or LF in subject, name, or address rejected. |
+| SMTP transport, in-process fake server with a test TLS certificate | STARTTLS and implicit TLS both succeed; the message arrives intact; credentials are sent only after TLS. Failures: server doesn't offer STARTTLS (refused before sending credentials), wrong certificate, authentication rejected, recipient rejected (all **not sent**), connection dropped after the message data (**unknown**). The context deadline stops a server that never replies. |
+| SMTP config | Missing or invalid host, port, from address, or TLS mode is reported before connecting. |
+| SMS part counter | GSM-7 at 160 and 161 characters, double-counted extended characters, a curly apostrophe switching to UCS-2, multipart boundaries (153 and 67), the 1,530 and 630 maximums. |
+| AWS request shape, `httptest` server as the SDK endpoint | `X-Amz-Target` is `PinpointSMSVoiceV2.SendTextMessage`; a SigV4 `Authorization` header is present; JSON has the expected destination, origination identity, `TRANSACTIONAL`, and body, and the configuration set only when configured. |
+| AWS responses | The message ID is stored on success. Each error in the table above maps to the right message and to **not sent** or **unknown**. A 500 is attempted exactly once (no SDK retry). AWS's API reference has no example error bodies, so the fake responses are written in the AWS JSON 1.0 error format with the exception names and reason codes from AWS's API model. |
+| AWS config | Missing keys, region, or origination identity fail before any request. With `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, and `AWS_PROFILE` set in the test, the provider still uses only its own config. |
+| `toE164` table test | For each of the six countries: national and international formats, spaces, dashes, dots, parentheses, `00` and `011` prefixes, extensions, too short, too long, letters, empty. |
+| Secrets redaction (extended) | Each secret field is redacted on read and restored on save; non-secret fields pass through; a placeholder for a field with no stored value is not saved as the literal placeholder. |
+| `SendTestMessage` | Requires a session; audited on success and on failure; unknown provider rejected. |
+| `TestAWSSMSLive` (opt-in) | Skipped unless `AWS_SMS_LIVE_TEST=1` and credentials are set. Sends a `DryRun` request (free, nothing delivered), then, if a simulator destination number is given, a real send from a simulator origination number. CI never runs it. |
+| `TestSMTPLive` (opt-in) | Skipped unless SMTP settings are in the environment. Sends to `success@simulator.amazonses.com` when pointed at SES. |
 
-**Manual:** configure both providers in the app against the AWS sandbox. Send a test SMS to
-a simulator number and a test email to `success@simulator.amazonses.com`. Confirm the
-password and secret key show as redacted after saving and reloading.
+**Manual:** in the app, configure both providers against the AWS sandbox. Send a test SMS to
+a simulator number and a test email to `success@simulator.amazonses.com`. Confirm the password
+and secret key show as redacted after saving and reloading, and that the audit log records
+each test send.
+
+**Estimated size:** about 550 lines of code and 750 lines of tests (revised up from the first
+estimate because of the error classification, part counter, and TLS enforcement).
+
+#### Decisions
+
+1. **Phone normalization:** `nyaruka/phonenumbers`. It may be revisited because of its size
+   (see below).
+2. **Microsoft 365:** not supported in this PR. Its password-based SMTP is being retired, and
+   proper support needs OAuth2.
+
+#### Outcome
+
+Implemented as planned, with these differences:
+
+- **Size:** about 600 lines in the four new files plus about 280 changed lines elsewhere; about
+  1,080 lines of tests.
+- **A bug the tests caught:** when the connection drops after a request is sent, the AWS SDK
+  still reports a `ResponseError`, with HTTP status 0. The first version treated anything
+  under 500 as "AWS rejected it, not sent", which would have let PR 3 retry a text that may
+  already have been delivered. Status 0 is now treated as "no response", and
+  `TestAWSSMSProvider_SendWithoutResponse` covers it.
+- **Phone numbers are now validated for real.** `+1 555 555 0100` (area code 555 doesn't
+  exist) and the UK's fictional `07700 900xxx` range are rejected. The existing
+  `TestNotificationService_SendNotification` used `+15555550100`, so it now uses
+  `+1 (202) 555-0123` and also checks that the number is normalized to E.164. Every demo
+  patient's phone number uses area code 555 (for example `(555) 111-2233`), so SMS to demo
+  patients is rejected as an invalid number. To test SMS with demo data, edit a patient's
+  number first.
+- **Binary size.** The server binary (`-tags server`, stripped) grew from 22.2 MB to 28.3 MB
+  (+6.1 MB, about 27%). Measured by building with each part removed:
+
+  | Part | Added |
+  | --- | --- |
+  | `nyaruka/phonenumbers` and the `google.golang.org/protobuf` runtime it requires | 4.2 MB |
+  | AWS SDK (`pinpointsmsvoicev2`, `smithy-go`, credentials) | 1.2 MB |
+  | SMTP provider and the rest of PR 2 | 0.65 MB |
+
+  `phonenumbers` embeds carrier and geocoding data (0.9 MB) that LibreDental doesn't use and
+  can't strip, and protobuf brings its reflection runtime. If that cost is too high, the hand-
+  written alternative can replace `toE164` and `toSMSNumber` without touching anything else.
+
+**Results:** `task format` and `task test` are clean, as are CI's `gofmt -l`,
+`go vet ./internal/...`, and Prettier's check. Three guard tests were checked by disabling
+the guard they cover: re-enabling SDK retries fails `TestAWSSMSProvider_SendErrors` (3
+attempts instead of 1); removing the STARTTLS requirement fails
+`TestSMTPEmailProvider_Send/STARTTLS_not_offered`; and removing `password` from the redacted
+fields fails `TestSecretsService_RedactsEverySecretField`. Each passed again once restored.
+
+**Manual (done):** the [manual test guide](#manual-test-guide) below was followed against the
+AWS sandbox, with SES SMTP for email and a simulator number for SMS.
+
+#### Manual test guide
+
+Nothing in the app sends to patients until PR 3, so these steps exercise the providers
+through **My Clinic > Integrations > Send a test message**. They use the AWS sandbox and
+simulators only, so no real patient is contacted and almost nothing is spent. Never enter a
+real patient's contact details. Commands assume `us-east-1`.
+
+**1. AWS setup (once).** The CLI can run as your own admin login; the app gets separate,
+narrow credentials.
+
+- *Email:* in the SES console, under **Identities**, verify an email address you own (click
+  the link SES emails you). While the account is in the SES sandbox, mail can only be sent
+  from and to verified addresses, plus SES's mailbox simulator addresses. Then, under
+  **SMTP settings**, choose **Create SMTP credentials** and save the username and password
+  (shown once). Note the endpoint, `email-smtp.us-east-1.amazonaws.com`.
+- *SMS:* request a simulator origination number and note its `PhoneNumber`:
+
+  ```bash
+  aws pinpoint-sms-voice-v2 request-phone-number --iso-country-code US \
+    --message-type TRANSACTIONAL --number-capabilities SMS --number-type SIMULATOR
+  ```
+
+  Create an IAM user that can only send texts, and an access key for it (the secret is shown
+  once):
+
+  ```bash
+  aws iam create-user --user-name libredental-sms-dev
+  aws iam put-user-policy --user-name libredental-sms-dev --policy-name SendTextOnly \
+    --policy-document '{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":"sms-voice:SendTextMessage","Resource":"*"}]}'
+  aws iam create-access-key --user-name libredental-sms-dev
+  ```
+
+  `Resource: "*"` is acceptable for a sandbox; PR 4's Terraform module narrows it to the
+  practice's number.
+
+**2. Start the app.** Run `task desktop` (or `task server` and open `http://localhost:4242`),
+log in, and make sure the practice country is the US, so numbers typed without `+1` are read
+as US numbers.
+
+**3. Email.** In Integrations, choose `smtp_email` and enter: SMTP server
+`email-smtp.us-east-1.amazonaws.com`, Encryption STARTTLS, Port blank (587), the SMTP
+username and password, From address = your verified address, and a From name. Save.
+
+| Check | Expected |
+| --- | --- |
+| Send a test to `success@simulator.amazonses.com` | "Test message sent." |
+| Send a test to your verified address | The email arrives (check spam). Its headers include LibreDental's `Message-ID`. |
+| Switch to another provider and back | The password field shows 8 dots. An SES SMTP password is 44 characters, so 8 means the frontend got the redacted placeholder, not the secret. |
+| Save again without retyping the password, then send a test | Still works: the stored password was kept. |
+| Change the From address to an unverified one and send | Error: SES rejects the unverified address. Restore it afterwards. |
+| Enter a wrong password and send | Error: SMTP sign-in failed. |
+| Set Encryption to "TLS from the start" with port blank (465) | Works. |
+| `aws sesv2 get-account --query SendQuota.SentLast24Hours` | The count went up. |
+
+**4. SMS.** Choose `aws_sms` and enter the IAM user's access key ID and secret, region
+`us-east-1`, and the simulator number as the sending number. Leave the configuration set
+blank for now. Save.
+
+| Check | Expected |
+| --- | --- |
+| Send a test to `+14254147755` (US success simulator) | "Test message sent." |
+| Send a test to `(425) 414-7755` | Same result: the number is converted to `+14254147755` before sending. |
+| Send a test to `555-0123` or `+1 555 555 0100` | Rejected by the app as an invalid number; nothing reaches AWS. |
+| Send a test to your own mobile number | AWS rejects it: a simulator number can only text simulator numbers. The error shows AWS's reason. |
+| Send a test to `+14254147167` (US failure simulator) | Most likely "sent". The simulated failure is reported later as a delivery event, not as an error from `SendTextMessage`. |
+| Switch providers and back | The secret access key field shows 8 dots, not the 40-character secret. |
+
+To see delivery events, optionally create a configuration set in the End User Messaging SMS
+console with a CloudWatch Logs event destination, enter its name as the configuration set,
+save, and send to both simulator numbers. The success and failure events then appear in the
+log group.
+
+**5. Audit trail.** In the Audit tab, each test send appears with resource
+`notification_test`, your name, the provider, the recipient, and, for failures, the reason.
+None of them are attached to a patient.
+
+**6. Secrets stay out of the database (optional).** The SMTP password and AWS secret appear
+under "LibreDental" in the OS keychain (on Ubuntu: the *Passwords and Keys* app), and
+`grep -c '<the SMTP password>' ~/.config/LibreDental/libredental.db` prints `0`.
+
+**7. Clean up.** Release the simulator number when you're done with SMS testing
+(`aws pinpoint-sms-voice-v2 release-phone-number --phone-number-id <id>`), and delete the
+access key if you won't need it for PR 3
+(`aws iam delete-access-key --user-name libredental-sms-dev --access-key-id <id>`).
 
 ### PR 3: Automatic reminders
 
@@ -463,3 +739,13 @@ Use a personal AWS account for development, with these rules:
 - [AWS End User Messaging SMS: simulator phone numbers](https://docs.aws.amazon.com/sms-voice/latest/userguide/test-phone-numbers.html)
 - [AWS End User Messaging SMS: quotas](https://docs.aws.amazon.com/sms-voice/latest/userguide/quotas.html)
 - [AWS End User Messaging SMS: spend limits](https://docs.aws.amazon.com/sms-voice/latest/userguide/spend-limit.md)
+- [AWS End User Messaging SMS: SendTextMessage API](https://docs.aws.amazon.com/pinpoint/latest/apireference_smsvoicev2/API_SendTextMessage.html)
+- [AWS End User Messaging SMS: character limits](https://docs.aws.amazon.com/sms-voice/latest/userguide/sms-limitations-character.html)
+- [AWS SDK for Go v2: retries and timeouts](https://docs.aws.amazon.com/sdk-for-go/v2/developer-guide/configure-retries-timeouts.html)
+- [Amazon SES: connecting to an SMTP endpoint](https://docs.aws.amazon.com/ses/latest/dg/smtp-connect.html)
+- [Amazon SES: obtaining SMTP credentials](https://docs.aws.amazon.com/ses/latest/dg/smtp-credentials.html)
+- [Go CVE-2017-15042: net/smtp PlainAuth sent credentials without TLS](https://go.googlesource.com/vulndb/+/a2c41878c4ef/data/reports/GO-2021-0178.yaml)
+- [Office 365 for IT Pros: SMTP AUTH basic authentication retirement delayed](https://office365itpros.com/2026/01/29/smtp-auth-basic-retirement/)
+- [Google Workspace SMTP: app passwords and OAuth](https://developer.nylas.com/docs/cookbook/email/gmail-smtp-settings/)
+- [Google and Yahoo sender requirements](https://www.twilio.com/en-us/blog/insights/new-sending-requirements-for-gmail-yahoo)
+- [nyaruka/phonenumbers](https://github.com/nyaruka/phonenumbers)
