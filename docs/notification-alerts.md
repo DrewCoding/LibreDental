@@ -1,11 +1,12 @@
 # Appointment Reminders (Email and SMS)
 
-> **Status:** in progress (branch `sms-notif`). PR 1 (system actor) and PR 2 (email and SMS
-> providers) are implemented; PRs 3 and 4 are planned. Last updated 2026-10-05.
+> **Status:** in progress (branch `sms-notif`). PRs 1 to 3 (system actor, email and SMS
+> providers, automatic reminders) are implemented; PR 3's manual testing and PR 4 remain. Last updated 2026-10-05.
 
 LibreDental will send automatic appointment reminders to patients by email and text message.
 This document records the design decisions, the research behind them, and how the feature
-fits into the existing notification framework from #89.
+fits into the existing notification framework from #89. For the steps a practice follows to
+set reminders up, see [Setting Up Appointment Reminders](appointment-reminders-setup.md).
 
 ## Design decisions
 
@@ -139,8 +140,9 @@ relied on.
 The plan is **claim before send**, a variant of the transactional outbox pattern:
 
 1. Insert a `notification_log` row with status `pending` before calling the vendor. A unique
-   index on `(appointment_id, reminder_kind, channel)` makes a second claim fail, so only one
-   process can send.
+   index on `(appointment_id, appointment_start, reminder_kind, channel)` makes a second claim
+   fail, so only one process can send. The appointment's start time is part of the key so
+   that a rescheduled appointment gets reminders for its new time.
 2. Call the vendor.
 3. Update the row to `sent` or `failed`.
 
@@ -149,8 +151,8 @@ retried automatically, because the message may or may not have gone out. It's sh
 as "status unknown". For reminders, a missed message is less harmful than a duplicate, and
 duplicates also count against the TCPA limits below.
 
-This needs an additive migration on `notification_log`: a nullable `reminder_kind` column
-(NULL for manual sends) and the unique index. SQLite treats NULLs as distinct in unique
+This needs an additive migration on `notification_log`: nullable `reminder_kind` and
+`appointment_start` columns (NULL for manual sends) and the unique index. SQLite treats NULLs as distinct in unique
 indexes, so existing rows and manual sends are unaffected. The migration is generated with
 Atlas, per `AGENTS.md`.
 
@@ -204,9 +206,10 @@ phase.
 
 - `practice_config` gets a timezone column (IANA name, for example `America/Los_Angeles`).
   Appointment times are rendered in it, not in the server machine's local timezone.
-- Reminders are only sent inside configurable quiet hours (default 08:00 to 21:00 in the
-  practice's timezone). A reminder that falls outside them moves to the next allowed time, as
-  long as that's still before the appointment.
+- Reminders are only sent during configurable sending hours (default 08:00 to 20:00 in the
+  practice's timezone). A reminder that comes due outside them waits for the next allowed
+  time, unless that's past its latest send. See
+  [How reminders will work](#how-reminders-will-work).
 
 ### When the job runs
 
@@ -232,7 +235,7 @@ Sizes are rough estimates to help reviewers plan, not commitments.
 | --- | --- | --- | --- |
 | 1 | System actor | None | ~80 / ~150 lines |
 | 2 | Email and SMS providers, send test | None | ~550 / ~750 lines |
-| 3 | Automatic reminders | Yes, additive | ~1,100 / ~1,000 lines |
+| 3 | Automatic reminders | Yes, additive | ~1,300 / ~1,300 lines |
 | 4 | Optional Terraform module | None | ~250 HCL / ~80 lines |
 
 ### PR 1: System actor (implemented)
@@ -560,7 +563,7 @@ username and password, From address = your verified address, and a From name. Sa
 | Change the From address to an unverified one and send | Error: SES rejects the unverified address. Restore it afterwards. |
 | Enter a wrong password and send | Error: SMTP sign-in failed. |
 | Set Encryption to "TLS from the start" with port blank (465) | Works. |
-| `aws sesv2 get-account --query SendQuota.SentLast24Hours` | The count went up. |
+| `aws sesv2 get-account --query SendQuota.SentLast24Hours` | The count went up for sends to your verified address. Sends to the mailbox simulator don't count toward it. |
 
 **4. SMS.** Choose `aws_sms` and enter the IAM user's access key ID and secret, region
 `us-east-1`, and the simulator number as the sending number. Leave the configuration set
@@ -593,71 +596,491 @@ under "LibreDental" in the OS keychain (on Ubuntu: the *Passwords and Keys* app)
 access key if you won't need it for PR 3
 (`aws iam delete-access-key --user-name libredental-sms-dev --access-key-id <id>`).
 
-### PR 3: Automatic reminders
+### PR 3: Automatic reminders (implemented)
 
 The largest PR. It contains the only schema changes.
 
-**Schema** (edited declaratively, migration generated with `atlas migrate diff --env main`,
-then `atlas migrate hash`). All changes are additive:
+This section starts with the research done before implementation (2026-10-06), then the
+decisions made from it, and the plan that follows from both.
+
+#### Research: how appointments and times work today
+
+1. **Appointments are stored as UTC instants.** `appointment_repo.go` writes `start_time` and
+   `end_time` as RFC 3339 UTC strings (`2026-10-07T21:00:00Z`) and filters date ranges by
+   string comparison, which works because every row has the same format.
+
+2. **Rescheduling changes `start_time` in place.** `UpdateAppointment` edits the same row
+   (with optimistic locking on `version`). A duplicate-prevention key of
+   `(appointment_id, reminder_kind, channel)` would therefore block the reminder for the new
+   time after a reschedule. **The key must include the appointment's start time.**
+
+3. **Appointments can be hard-deleted.** `DeleteAppointment` removes the row, and
+   `notification_log.appointment_id` is set to NULL (`ON DELETE SET NULL`). The history row
+   survives without its link, and the partial unique index ignores it. The pre-send re-check
+   must treat "appointment not found" as "skip".
+
+4. **The practice's timezone today is whatever timezone the staff computers use.** The
+   appointment form (`App.svelte`, `handleSaveAppt`) builds
+   `new Date("YYYY-MM-DDTHH:MM:00").toISOString()`, which reads the typed time in the
+   *client's* timezone (the desktop app, or a LAN browser) and stores the UTC result. Every
+   view displays times in the client's timezone too. Go code never uses a timezone, except
+   the demo seeder (`America/Los_Angeles`). So:
+   - the reminder job must never use the server process's `time.Local`; in LAN mode the
+     server PC's timezone has nothing to do with how appointments were entered;
+   - the configured practice timezone must match the staff computers, or every reminder
+     shows the wrong time. The settings screen can default it from the browser
+     (`Intl.DateTimeFormat().resolvedOptions().timeZone`) and warn when the two differ.
+
+5. **Times are always shown in 12-hour format.** `AppointmentsView.svelte` hard-codes
+   `hour12: true`. `practice_config.date_format` exists per country (`MM/DD/YYYY` for the US,
+   `DD/MM/YYYY` for GB, AU, and FR, `DD.MM.YYYY` for DE, `YYYY-MM-DD` for CA), but there is no
+   time-format setting. Reminder text needs both. Go has no locale data for month or weekday
+   names, so numeric dates in the practice's `date_format` avoid translating them in Go.
+
+6. **Everyone is opted in by default, and that flag has never done anything.** The schema
+   default is `reminder_opt_in INTEGER NOT NULL DEFAULT 1`, the patient form treats a missing
+   value as opted in (`reminderOptIn = p.reminder_opt_in !== false`), and every demo patient
+   is opted in. Until now nothing sent to patients, so the checkbox had no effect. Once
+   automatic reminders exist, it decides who gets texts and emails. **This changes what
+   existing stored data means**, which `AGENTS.md` says must be called out. See
+   [Open decisions](#open-decisions-for-pr-3).
+
+7. **Preferred contact method defaults to "phone".** The choices are `phone`, `sms`, and
+   `email`, and the form defaults to `phone`, meaning a voice call, for which there is no
+   provider. If reminders follow this preference, most patients would get none.
+
+8. **Preferred language defaults to "en" in the form but `''` in the database**, and the
+   frontend only has an English locale today.
+
+9. **Patients can be archived** (`status = 'archived'`). Archived patients must not get
+   reminders.
+
+10. **No screen shows notification history yet.** `ListNotificationLog` and
+    `ListNotificationLogForAppointment` exist in Go but nothing in the frontend calls them.
+
+11. **The demo data never triggers a reminder.** Scheduled demo appointments are pushed a
+    year ahead, and every demo phone number uses area code 555, which PR 2 rejects as
+    invalid. Manual testing needs an edited patient and appointment. Changing the demo
+    fixtures is out of scope.
+
+#### Research: database and migrations
+
+12. **Timestamps written by the driver are not SQL-friendly.** With no `_time_format`
+    setting, `modernc.org/sqlite` stores Go `time.Time` values in Go's own format
+    (`2026-10-05 09:30:00 +0000 UTC`). That applies to `notification_log.sent_at` and every
+    `created_at`. SQLite's date functions can't parse it (`julianday(sent_at)` is NULL).
+    String comparison still sorts correctly, but only when every value is UTC. New columns
+    that are compared should store RFC 3339 UTC strings, like `appointments.start_time`, and
+    queries must always pass UTC times.
+
+13. **Two schedulers on one database is a supported setup.** `lan-server-setup.md` supports
+    running the desktop app on the server PC alongside the server process, both using
+    `libredental.db`, and `SingleInstance` isn't configured, so two desktop windows also each
+    run a job. A unique index stops exact duplicates, but not two processes each deciding a
+    patient is under the daily limit for *different* appointments. The frequency check and
+    the claim must therefore be one atomic statement: a conditional
+    `INSERT ... SELECT ... WHERE (count of recent sends) < limit`. SQLite runs each statement
+    atomically and serializes writers. (The driver's `_txlock=immediate` option would also
+    work, but it applies to every transaction on the connection.)
+
+14. **Concurrency settings are already suitable.** The database uses WAL with a 5-second
+    busy timeout, so a background writer waits rather than failing when the UI is writing.
+
+15. **IDs based on the clock can collide.** `SendNotification` uses
+    `notif_<nanoseconds>`. Two schedulers could, rarely, generate the same ID, which would
+    fail on the primary key rather than on the duplicate-prevention index and be misreported.
+    New rows should use UUIDs (`github.com/google/uuid` is already a dependency).
+
+16. **Migration rules confirmed.** goose runs each migration in a transaction, and the
+    previous migration was hand-edited because Atlas's table rebuild (copy, drop, rename)
+    breaks on populated databases in a transaction. The planned changes avoid rebuilds:
+    `ADD COLUMN ... NULL`, `CREATE TABLE`, and `CREATE UNIQUE INDEX ... WHERE` are all done in
+    place. SQLite doesn't allow `ADD COLUMN` with `UNIQUE`, so uniqueness has to come from the
+    separate index anyway. In the down migration, the index must be dropped before its
+    columns, because SQLite can't drop an indexed column. `TestMigrations_UpgradePreservesPatientData`
+    already upgrades and rolls back a populated database and can be extended.
+
+17. **Atlas isn't installed on this machine.** `migrate diff` is available in both the free
+    official build and the Apache-licensed Community Edition, and Atlas supports SQLite
+    partial indexes. Install with `curl -sSf https://atlasgo.sh | sh` before starting.
+
+#### Research: running a background job in this app
+
+18. **Wails provides the lifecycle.** A service can implement
+    `ServiceStartup(ctx, options)`, whose context stays valid while the app runs and is
+    cancelled just before shutdown, and `ServiceShutdown()`, which runs before `App.Run`
+    returns, so before `main.go`'s deferred `db.Close()`. Wails leaves `ServiceStartup`,
+    `ServiceShutdown`, `ServiceName`, and `ServeHTTP` out of the frontend bindings (both when
+    generating bindings and at runtime), so the bound reminder settings service can own the
+    job safely. A bound-methods test like PR 1's should pin its exported methods.
+
+19. **Timers pause while the computer sleeps.** Go's timers run on a monotonic clock that
+    doesn't advance during suspend on Linux and Windows. A short ticker (5 minutes) still
+    fires soon after waking; what matters is deciding what's due from the wall clock
+    (`time.Now()` against stored times), never from elapsed ticks. Catch-up after waking
+    then works the same as catch-up at startup.
+
+20. **Failures need to be visible.** A Linux server run as a system service has no keyring
+    (`lan-server-setup.md`), so the job can fail to read provider credentials on every pass.
+    Those failures aren't patient actions, so they don't belong in the audit trail on every
+    tick. The job should keep its last run time, counts, and last error where the Reminders
+    screen can show them.
+
+21. **Windows needs bundled timezone data.** `time.LoadLocation` reads
+    `$GOROOT/lib/time/zoneinfo.zip`, which end-user Windows machines don't have. Importing
+    `time/tzdata` embeds it (about 450 KB).
+
+22. **A browser timezone list may not be available.** `resolvedOptions().timeZone` is widely
+    supported, but I couldn't confirm `Intl.supportedValuesOf("timeZone")` in WebKitGTK and
+    WebView2. A curated list of the zones in the six supported countries (for example the
+    US's six main zones, Canada's, Australia's, `Europe/London`, `Europe/Berlin`,
+    `Europe/Paris`) avoids depending on it and is easy to review.
+
+#### Research: rules for the messages themselves
+
+23. **The FCC healthcare exemption limits reminder texts to 160 characters.** Its full
+    conditions for appointment reminders: sent only to the number the patient gave; the
+    practice's name and contact information in the message; no marketing, solicitation, or
+    billing content; concise (160 characters or less for a text); an opt-out mechanism; and
+    at most one message per day and three per week per practice. A text holding the
+    practice's name, phone number, the date and time, the patient's first name, and the
+    opt-out text is tight at 160 characters, so the limit must be checked on the *rendered*
+    message, including long names, not only on the template.
+
+24. **Quiet hours.** Federal rules limit *telemarketing* to 8 a.m. to 9 p.m. in the
+    recipient's time zone, and Florida's law narrows that to 8 p.m. Appointment reminders
+    are informational and generally outside those limits, but a conservative default of
+    08:00 to 20:00 costs nothing. The recipient's timezone is assumed to be the practice's.
+
+25. **Reminder timing.** Industry sources (mostly reminder vendors, so weak evidence)
+    recommend more than one reminder, for example 2 to 3 days before plus one on the day.
+    Combined with one text per day and three per week, a sensible default is two rules:
+    2 days before (SMS and email) and 2 hours before (SMS only). Email isn't covered by the
+    TCPA limits, but the same rules keep it reasonable.
+
+#### What the research changes
+
+Compared with the first plan (all now part of the plan below):
+
+- **Duplicate key:** `(appointment_id, appointment_start, reminder_kind, channel)`, with a new
+  `notification_log.appointment_start` column (RFC 3339 UTC), so a rescheduled appointment
+  gets reminders for its new time. (Findings 2 and 12.)
+- **Atomic claim:** the frequency limit and the claim become a single conditional `INSERT`,
+  safe with two schedulers. (Finding 13.)
+- **UUIDs** for new `notification_log` rows. (Finding 15.)
+- **SMS length:** rendered text messages over 160 characters are not sent; they're logged as
+  failed with the reason, and the template editor previews the length with long sample
+  values. (Finding 23.)
+- **Timezone setting:** defaults from the browser, warns on mismatch, uses a curated zone
+  list, and the job never uses `time.Local`. (Findings 4, 21, 22.)
+- **Date and time format:** numeric date in `date_format`, plus a 12- or 24-hour setting.
+  (Finding 5.)
+- **Job status** (last run, counts, last error) shown on the Reminders screen. (Finding 20.)
+- **Lifecycle:** the job starts in the reminder service's `ServiceStartup` and stops in
+  `ServiceShutdown`. (Finding 18.)
+- **Archived patients** are skipped, and **deleted appointments** are treated as "skip".
+  (Findings 3 and 9.)
+- **Before starting:** install Atlas. (Finding 17.)
+
+#### Decisions for PR 3
+
+Made on 2026-10-06:
+
+1. **Reminders ship off; option A below.** Staff turn them on with a confirmation that shows
+   how many patients would receive them, and new patients default to not opted in.
+2. **Each rule names its channel** and goes to every opted-in patient with contact details
+   for it; `preferred_contact_method` isn't used.
+3. **English only for now.** The practice using LibreDental is in the US.
+4. **Default rules:** 2 days before (SMS and email) and 2 hours before (SMS).
+
+The options that were considered for the first decision:
+
+1. **What `reminder_opt_in` means now.** (Finding 6.) Options:
+   - *A (recommended):* keep the existing flag as the patient's preference, ship reminders
+     **off**, and when staff turn them on, show how many patients would receive them and
+     require an explicit confirmation. New patients default to **not** opted in from now on
+     (a form change only; the database default is unused because the form always sends a
+     value).
+   - *B:* add a new consent column that starts empty for everyone, so nobody receives
+     reminders until staff record consent per patient. Safest, but a lot of clerical work.
+   - *C:* keep everything as is. Not recommended: patients who never chose reminders would
+     start receiving them.
+2. **Which channel each patient gets.** (Finding 7.) Either each rule names its channel and
+   is sent to every opted-in patient with contact details for it, or reminders follow
+   `preferred_contact_method` (with `phone` meaning no reminder, or falling back to SMS).
+3. **Language and format.** English-only templates for now (the frontend has only English),
+   with numeric dates and a 12/24-hour setting; or per-language templates keyed by
+   `preferred_language`.
+4. **Default rules.** 2 days before (SMS and email) and 2 hours before (SMS), or something
+   else.
+
+#### Research sources
+
+- [FCC healthcare exemption conditions (Bass, Berry & Sims)](https://bassberry.com/news/tcpa-exemptions-for-healthcare-companies/)
+- [FCC 2015 ruling for healthcare calls (Kutak Rock)](https://www.kutakrock.com/newspublications/publications/2015/08/fcc-clarifies-tcpa-robocalls-rules-for-health-care)
+- [State texting time rules, including Florida (ActiveProspect)](https://activeprospect.com/blog/tcpa-state-regulations/)
+- [SQLite: ALTER TABLE](https://www.sqlite.org/lang_altertable.html)
+- [SQLite: partial indexes](https://sqlite.org/partialindex.html)
+- [Atlas Community Edition](https://www.atlasgo.io/community-edition)
+- [Go issue 38453: embedding timezone data](https://golang.org/issue/38453)
+- [Go issue 35012: timers and system sleep](https://golang.org/issue/35012)
+- [Solutionreach: reminder timing analysis](https://www.businesswire.com/news/home/20190306005043/en/Solutionreach-Data-Analysis-Uncovers-Optimal-Patient-Reminder-Timing-to-Maximize-Appointments)
+- [Curogram: best time to send an appointment reminder](https://curogram.com/blog/best-practices/appointment-management/best-time-send-appointment-reminder)
+
+#### How reminders will work
+
+**Turning reminders on.** Reminders ship **off**. When staff turn them on, the Reminders
+screen shows how many active, opted-in patients have a mobile number and an email address,
+and asks for confirmation. Turning them on or off is audited under the staff member, with
+those counts. From this PR on, the patient form defaults new patients to **not** opted in
+(`App.svelte`, the new-patient reset at line 426). Existing patients keep their stored
+value, and the database default is unchanged, because the form always sends a value.
+
+**Rules.** Turning reminders on for the first time creates three rules, with English
+templates from Paraglide:
+
+| Rule | Channel | Sent | Latest send |
+| --- | --- | --- | --- |
+| 2 days before | SMS | 48 hours before the appointment | 12 hours before |
+| 2 days before | Email | 48 hours before the appointment | 12 hours before |
+| 2 hours before | SMS | 2 hours before the appointment | 30 minutes before |
+
+Each rule names its channel and provider, and goes to every active, opted-in patient who has
+contact details for that channel. `preferred_contact_method` is not used. Staff can turn
+each rule on or off and edit its templates; adding rules with other timings is left for
+later. A rule's "latest send" is the appointment start minus a quarter of its offset: past
+that, a late reminder (after the app was closed, or held back by sending hours) is skipped
+rather than sent too close to the appointment.
+
+**Sending hours.** Reminders are sent only between 08:00 and 20:00 in the practice's
+timezone (configurable). A reminder that comes due outside those hours waits for the next
+allowed time, unless that is past its latest send. For example, the 2-hour text for a 9:00
+appointment comes due at 7:00 and its latest send is 8:30, so it waits and goes out at 8:00.
+The 2-hour text for an 8:15 appointment comes due at 6:15 and its latest send is 7:45, before
+sending hours open, so it is skipped; that patient still received the 2-day reminder.
+
+**Message text.** English only for now. Numeric dates in the practice's `date_format`
+(`MM/DD/YYYY` for the US), and the time in 12-hour format for US, CA, and AU practices and
+24-hour for GB, DE, and FR. Placeholders: `{first_name}`, `{date}`, `{time}`,
+`{practice_name}`, `{practice_phone}`; nothing else from the chart can be used. Default SMS
+templates include the practice's name and phone and "Reply STOP to opt out."
+
+**Each pass of the job** (every 5 minutes, and once at startup):
+
+1. Do nothing if reminders are off, or the practice has no timezone set.
+2. Load scheduled and confirmed appointments starting between now and 48 hours from now.
+3. For each enabled rule and appointment: skip unless the rule is due now (past its due
+   time, within sending hours, not past its latest send).
+4. Re-read the appointment and patient. Skip silently, writing nothing, if the appointment
+   is gone or no longer scheduled or confirmed, or the patient is archived, opted out, or
+   has no contact details for the channel. The reminder can still go out later if that
+   changes in time.
+5. Render the message. If the phone number is invalid or the text is over 160 characters,
+   record the reminder as **skipped** with the reason, so staff can see it and it isn't
+   retried every pass.
+6. **Claim** it with one atomic `INSERT`: a `pending` row keyed by appointment, appointment
+   start, reminder kind, and channel, inserted only if, for SMS, the patient has had no text
+   reminder today (in the practice's timezone) and fewer than three in the last 7 days. If
+   the key already exists, another pass or process has handled it. If the limit stops it,
+   record it as **skipped** with the reason.
+7. Send through the provider, then update the row to **sent**, **failed** (definitely not
+   sent), or **unknown** (`domain.ErrDeliveryUnknown`). Audit the attempt as
+   `system:reminders`, with the patient and the log row's ID.
+8. Remember the pass's time, counts, and any error (for example, credentials that can't be
+   read) for the Reminders screen.
+
+Rows left `pending` by a crash are shown as "status unknown" and never retried.
+
+#### Plan
+
+Delivered as one PR in separately reviewable commits: schema; storage; sending path and job;
+reminder service and lifecycle; frontend; docs.
+
+**Before starting:** install Atlas (`curl -sSf https://atlasgo.sh | sh`).
+
+**Schema.** Edited declaratively, migration generated with `atlas migrate diff --env main`,
+then `atlas migrate hash`. Every change is additive and done in place (no table rebuild):
 
 | Schema file | Change |
 | --- | --- |
-| `schema/notifications.sql` | `notification_log.reminder_kind TEXT` (nullable; NULL for manual sends). Partial unique index on `(appointment_id, reminder_kind, channel) WHERE reminder_kind IS NOT NULL`. |
-| `schema/config.sql` | `practice_config.timezone TEXT DEFAULT ''`. New single-row `reminder_settings` table (enabled, quiet-hours start and end). New `reminder_rules` table (offset before the appointment, channel, provider, subject and body templates, enabled, timestamps). |
+| `schema/notifications.sql` | `notification_log`: nullable `reminder_kind` (for example `2880m`; NULL for manual sends) and `appointment_start` (RFC 3339 UTC). Partial unique index on `(appointment_id, appointment_start, reminder_kind, channel) WHERE reminder_kind IS NOT NULL`. New `reminder_settings` table (single row: enabled, sending-hours start and end, when and by whom enabled, timestamps). New `reminder_rules` table (ID, offset in minutes, channel, provider, subject and body templates, enabled, timestamps; unique on offset and channel). |
+| `schema/config.sql` | `practice_config.timezone TEXT NULL DEFAULT ''`. |
 
-Existing installs get `timezone = ''`, and reminders stay off until someone sets a timezone.
-That way no reminder is ever rendered in a guessed timezone.
+New statuses (stored as text, no schema change): `pending`, `unknown`, `skipped`. Existing
+rows only use `sent` and `failed`, so their meaning doesn't change. Existing installs get
+`timezone = ''` and no `reminder_settings` row, which means reminders are off.
 
 **Modified**
 
 | File | Change |
 | --- | --- |
-| `internal/domain/notification.go` | `NotificationStatusPending`; `ReminderKind` on `NotificationLog`. |
+| `internal/domain/notification.go` | Statuses `pending`, `unknown`, `skipped`; `ReminderKind` and `AppointmentStart` on `NotificationLog`. |
 | `internal/domain/config.go` | `Timezone` on `PracticeConfig`. |
-| `internal/storage/repository.go` | `NotificationLogRepository` gains `Claim` (insert a `pending` row; returns a conflict error if the reminder was already claimed), `UpdateResult`, and `CountReminderSends(patientID, channel, since)`. New `ReminderRepository` interface. |
-| `internal/storage/sqlite/notification_repo.go` | Implement the new methods; read and write `reminder_kind`. |
+| `internal/storage/repository.go` | `NotificationLogRepository` gains `ClaimReminder` (the atomic conditional insert; reports claimed, already claimed, or over the limit), `RecordSkipped`, and `UpdateResult`. New `ReminderRepository`. |
+| `internal/storage/sqlite/notification_repo.go` | Implement the above; read and write the new columns. Compare `sent_at` only against UTC `time.Time` values. |
 | `internal/storage/sqlite/practice_config_repo.go` | Read and write `timezone`. |
-| `internal/services/notification_service.go` | Move `SendNotification`'s body into an unexported, actor-aware `deliver`. Manual sends pass the session user; the scheduler passes `system:reminders`. Reminder sends claim the row before calling the provider. |
-| `internal/services/config_service.go` | Validate the timezone with `time.LoadLocation`. |
-| `main.go` | Import `time/tzdata` so timezones work on Windows, which has no system timezone database for Go. Build the reminder service and scheduler; register the service with Wails; start the scheduler in a goroutine and stop it when the app exits. |
-| `frontend/src/views/ClinicView.svelte` | Add the Reminders section. |
-| `frontend/src/views/clinic/ClinicProfileSection.svelte` | Timezone picker. |
-| `frontend/src/components/PatientInfoPanel.svelte` | Notification history (uses the existing `ListNotificationLog`). |
-| `frontend/src/components/AppointmentModal.svelte` | The appointment's reminder history (uses the existing `ListNotificationLogForAppointment`). |
-| `frontend/messages/en.json` | Settings, history, statuses, and default templates. |
-| `docs/lan-server-setup.md` | Reminders run on the server in LAN mode. |
+| `internal/services/notification_service.go` | Move `SendNotification`'s body into an unexported `deliver` that takes an actor: the session user for manual sends, `system:reminders` for the job. New log rows get UUIDs. |
+| `internal/services/config_service.go` | Validate `timezone` with `time.LoadLocation`. |
+| `main.go` | Import `time/tzdata`. Create the reminder service and register it with Wails. |
+| `frontend/src/App.svelte` | New patients default to not opted in. |
+| `frontend/src/views/ClinicView.svelte` | Add a Reminders tab. |
+| `frontend/src/views/clinic/ClinicProfileSection.svelte` | Timezone picker: curated zones for the six countries, defaulting to the browser's zone, with a warning when it differs from this computer's. |
+| `frontend/src/components/PatientInfoPanel.svelte` | Notification history (existing `ListNotificationLog`). |
+| `frontend/src/components/AppointmentModal.svelte` | The appointment's reminder history (existing `ListNotificationLogForAppointment`). |
+| `frontend/messages/en.json` | Screen text, statuses, reasons, and default templates. |
+| `docs/lan-server-setup.md` | Reminders run wherever LibreDental runs; the server needs keyring access; the desktop app on the server PC is safe to run alongside it. |
 
 **Added**
 
 | File | Contents |
 | --- | --- |
-| `internal/storage/sqlite/migrations/<timestamp>_appointment_reminders.sql` | Generated by Atlas. |
-| `internal/domain/reminder.go` | `ReminderRule`, `ReminderSettings`. |
-| `internal/storage/sqlite/reminder_repo.go` + test | Reminder settings and rules storage. |
-| `internal/services/reminder_service.go` + test | Wails-bound, token-gated get/save for settings and rules. Every change is audited under the staff member. |
-| `internal/services/reminder_template.go` + test | Renders templates. Only the allowed placeholders exist (`{first_name}`, `{date}`, `{time}`, `{practice_name}`, `{practice_phone}`), so a template can't pull in chart data. Unknown placeholders are rejected when saved. |
-| `internal/services/reminder_scheduler.go` + test | Not bound to Wails. A ticker loop with an injectable clock. Each pass loads settings and finds upcoming appointments. For each rule that's due it re-checks the appointment and patient, applies quiet hours and the TCPA limits, renders the message, and calls `deliver` as the system actor. |
-| `frontend/src/views/clinic/RemindersSection.svelte` | On/off switch, quiet hours, rules, and template editor. Default templates come from Paraglide, so they're localized. Notes that desktop installs only send while the app is open. |
+| `internal/storage/sqlite/migrations/<timestamp>_appointment_reminders.sql` | Generated by Atlas. Down migration drops the index before its columns. |
+| `internal/domain/reminder.go` | `ReminderRule`, `ReminderSettings`, and the default rule timings. |
+| `internal/storage/sqlite/reminder_repo.go` + test | Settings and rules storage. |
+| `internal/services/reminder_template.go` + test | Placeholder rendering, date and time formatting by country, length checks. |
+| `internal/services/reminder_schedule.go` + test | Pure functions: is a rule due, next allowed sending time, latest send, the practice's "today" in UTC. Kept free of I/O so the timing rules are easy to test exhaustively. |
+| `internal/services/reminder_scheduler.go` + test | The pass described above, with an injectable clock. Not bound to Wails. |
+| `internal/services/reminder_service.go` + test | Wails-bound, token-gated: get and save settings and rules, preview who would receive reminders, enable and disable (with confirmation counts), and get the job's status. Starts the job in `ServiceStartup` and stops it in `ServiceShutdown`. |
+| `frontend/src/views/clinic/RemindersSection.svelte` | On/off with confirmation, sending hours, rules and template editor with a live 160-character check, job status, and a note that desktop installs only send while open. |
 
 **Tests**
 
 | Area | Checks |
 | --- | --- |
-| Migration upgrade (extend `TestMigrations_UpgradePreservesPatientData`) | Seed a `notification_log` row and a `practice_config` row on the previous schema, upgrade, and confirm both survive with `reminder_kind` NULL and `timezone` `''`. Roll back and confirm the down migration works. |
-| Notification repo (extended) | `Claim` succeeds once and conflicts the second time; manual sends (NULL kind) never conflict; `UpdateResult`; `CountReminderSends` windows. |
-| Reminder repo (new) | Settings and rules CRUD. |
-| Practice config repo (extended) | `timezone` round-trips. |
-| Template (new) | Every placeholder renders; unknown placeholders are rejected; date and time use the practice timezone and date format; SMS segment count is reported. |
-| Scheduler (new), fake clock and dummy provider | Sends when due. Doesn't send twice across two passes. Skips cancelled, completed, and no-show appointments, rescheduled appointments, opted-out patients, and patients with no contact for the channel. Holds messages during quiet hours and sends them once quiet hours end. Enforces 1 per day and 3 per week across appointments. Renders correctly across a DST change. Catch-up at startup skips appointments that have already started. A provider failure is logged as `failed` and not retried. A row left `pending` (simulated crash) is not resent. Does nothing while disabled or without a timezone. |
-| Scheduler concurrency (new) | Two schedulers on the same database run a pass at the same moment; exactly one message is sent. |
-| Audit (new) | Every scheduler send, success or failure, writes an audit entry with `user_id = system:reminders`, the patient, and the `notification_log` ID. Settings changes are audited under the staff member. |
-| Notification service (existing, kept passing) | `SendNotification` behaves as before after moving to `deliver`. |
-| Reminder service (new) | Requires a session; validates rules; audits changes. |
+| Migration upgrade (extend the existing test) | Seed `notification_log` and `practice_config` rows on the previous schema; upgrade; both survive with the new columns NULL or empty. Roll back and re-apply on the populated database. |
+| Notification repo | `ClaimReminder`: succeeds once; second claim for the same key reports "already claimed"; a reschedule (new `appointment_start`) can be claimed again; the daily and weekly SMS limits; manual sends never conflict. `UpdateResult` and `RecordSkipped`. |
+| Atomic limit | Two goroutines claim different appointments for the same patient at once: exactly one SMS claim succeeds. |
+| Schedule functions | Due and latest-send boundaries for both rules; sending hours, including the 9:00 and 8:15 examples above; DST changes in spring and fall; "today" across midnight in the practice's timezone. |
+| Templates | Every placeholder; US date and 12-hour time; 24-hour countries; unknown placeholders rejected; rendered text over 160 characters rejected, including with a long first name. |
+| Scheduler, fake clock and providers | Sends when due and only once across passes and restarts. A rescheduled appointment gets reminders for its new time. Skips cancelled, completed, no-show, deleted, archived, opted-out, and no-contact cases without writing anything. Records invalid numbers, over-long texts, and limit hits as skipped. Provider failures are `failed`; `ErrDeliveryUnknown` is `unknown`; a `pending` row is never resent. Does nothing while off or with no timezone. Catch-up after the app was closed honours latest send. |
+| Two schedulers | Two schedulers on one database run passes at the same time: each reminder is sent exactly once. |
+| Audit | Every send, failure, and unknown outcome is audited as `system:reminders` with the patient and log row ID; skips are not audited (nothing left the machine); enabling and disabling are audited under the staff member. |
+| Reminder service | Requires a session; validates rules and sending hours; enabling reports the counts; `TestReminderService_BoundMethods` pins the exported methods. |
+| Lifecycle | The job stops when the startup context is cancelled, and `ServiceShutdown` waits for a pass in progress. |
+| Existing tests | `SendNotification` behaves the same after moving to `deliver`. |
 
-**Manual:** with `task demo` data and the AWS sandbox, set the timezone, create a rule a few
-minutes ahead of a demo appointment whose contact details are changed to your own number or a
-simulator number, and watch it send once. Restart the app and confirm it doesn't resend.
-Check the Audit view shows the system actor. Repeat in server mode (`task server`).
+**Manual:** in the AWS sandbox, set the timezone, turn reminders on, and point a test
+patient's mobile number at the SMS success simulator and email at
+`success@simulator.amazonses.com`. Create appointments about 48 hours and 2 hours ahead,
+and confirm one of each reminder per appointment. Restart the app and confirm nothing is
+resent. Reschedule an appointment and confirm new reminders. Check the Audit tab shows
+`system:reminders`. Repeat with `task server`.
+
+**Estimated size:** about 1,300 lines of code and 1,300 lines of tests.
+
+#### Outcome
+
+Implemented as planned, with these differences and findings:
+
+- **A limit hit defers instead of being recorded as skipped.** The plan recorded it as
+  skipped, which is final. But a 2-day reminder held back today by another appointment's text
+  can still go out tomorrow, within its window. Now nothing is recorded and later passes try
+  again until the window closes. Reliably reaching the patient was judged more important than
+  showing the deferral.
+- **Interrupted sends become "unknown" after 10 minutes.** Each pass marks reminders still
+  `pending` after 10 minutes as `unknown` (a send is bounded by a 30-second timeout), so the
+  "status unknown" described above is visible in the history.
+- **Manual sends** now record `ErrDeliveryUnknown` as `unknown` rather than `failed`, and get
+  UUID-based IDs. Otherwise `SendNotification` is unchanged; it now shares
+  `providerConfig`/`send`/`deliveryStatus` with test sends and the reminder job.
+- **Profile saves would have cleared the timezone.** `ClinicView` saves the practice config
+  by sending a hand-built object of the fields it knows, and the backend replaces the whole
+  row. The timezone is now part of that object.
+- **Changing the practice's country resets the timezone** (`SetConfig` rebuilds the config
+  from country defaults, as it already did for the NPI). This fails safe: reminders stop and
+  the Reminders screen says the timezone isn't set.
+- **The lifecycle adapter lives in package `main`** (`reminder_lifecycle.go`). `services`
+  imports `internal/app`, so the adapter couldn't go there.
+- **Driver time format.** The SQLite driver writes `time.Time` values with
+  `time.Time.String`, which includes a `m=+...` suffix if the value still has a monotonic
+  reading. Every time bound in a query goes through `.UTC()`, which strips it; the code
+  comments say why.
+- **A bug the tests caught:** `createRules` saved each rule as it validated it, so a bad
+  second rule left the first saved, and the defaults were then never created (they're only
+  created when no rules exist). All rules are now validated before any is saved.
+- **Default text.** Paraglide treats `{name}` as its own parameter, so the default templates
+  are produced by passing each placeholder as its literal value (`{ first_name: "{first_name}" }`).
+  The 2-day text renders at 138 characters with an 11-letter first name, leaving room for a
+  practice name of about 34 characters; the editor's preview flags anything longer.
+- **New patients default to not opted in** (`App.svelte`); existing patients keep their value.
+- **Opt-in changes are now audited explicitly** (found during manual testing). Patient saves
+  were audited only as "Updated patient record", so the audit trail couldn't show who opted
+  a patient in or out of reminders, or when, even though reminders are now sent on that flag
+  alone. `UpdatePatient` reads the stored record first and appends "opted in to automated
+  reminders" or "opted out of automated reminders" when the flag changes; `CreatePatient`
+  records whether the new patient is opted in. Entries written before this change stay
+  generic and can't be backfilled. Covered by `TestPatientService_AuditsReminderConsent`,
+  which fails if the comparison is removed.
+- **Size:** about 1,900 new and 440 changed lines of code (about 600 of them Svelte) and
+  about 1,540 lines of tests, above the estimate mainly because of the frontend.
+
+**Results:** `task format` and `task test` are clean, as are CI's `gofmt -l`, `go vet ./...`,
+and Prettier's check, and the `-tags server` build compiles. The migration was generated by
+`atlas migrate diff` and Atlas reports no drift. Four guards were checked by breaking them and
+confirming a test fails:
+
+| Guard broken | Caught by |
+| --- | --- |
+| Limit check and insert as separate statements | `TestNotificationRepository_ClaimReminderIsAtomic` (8 of 8 simultaneous claims succeeded) |
+| Appointment start left out of the reminder key | `TestReminderScheduler_RescheduledAppointment` |
+| No latest-send cutoff | `TestReminderDueNow`, `TestReminderScheduler_CatchUpRespectsLatestSend` |
+| Rules saved one at a time | `TestReminderService_EnableRequiresTimezoneAndValidRules` |
+
+Each passed again once restored.
+
+**Manual (partly done, 2026-10-07):** the timezone, turning reminders on (with the confirmation
+counts and audit entry), 2-day reminders, rescheduling, and skips were tested in the desktop
+app against the AWS sandbox. A rescheduled appointment's 2-day reminder email reached a real
+Gmail inbox through SES; texts went to the SMS simulator; a patient with `111-111-1111` was
+skipped as an invalid number; and every send was audited as `system:reminders`. Still to do:
+the 2-hour reminder, turning reminders off, and server mode (steps 6, 10, and 11 of the
+[PR 3 manual test guide](#pr-3-manual-test-guide)).
+
+Manual testing also showed that **a failed send is final even when nothing about the
+recipient was wrong**. The first attempt failed with SES rejecting the saved SMTP password
+(`535 Authentication Credentials Invalid`), left over from the PR 2 wrong-password test.
+Correctly, nothing was sent and the failure was recorded and audited, but the reminder
+wasn't retried after the password was fixed; rescheduling the appointment was needed. See
+[Open questions](#open-questions).
+
+#### PR 3 manual test guide
+
+Uses the AWS sandbox setup from the [PR 2 guide](#manual-test-guide): SES SMTP for email and
+a simulator number for SMS, already configured in Integrations. Use only test patients.
+
+1. **Timezone.** In **My Clinic > Practice Profile**, edit, choose this computer's timezone
+   (the button offers it), and save. Save the profile again and confirm the timezone is still
+   set. Pick a different zone and check the mismatch warning appears; set it back.
+2. **New patients start unchecked.** Create a patient and confirm "Opt-in for Automated
+   Reminders" is unchecked. Then create a test patient with it **checked**, mobile number
+   `(425) 414-7755` (the SMS success simulator), and email `success@simulator.amazonses.com`.
+3. **Turn reminders on.** In **My Clinic > Reminders**, choose Turn On Reminders. The
+   confirmation shows the opted-in counts. Confirm; three rules appear with previews. In the
+   Audit tab, the "Turned on automatic reminders for N opted-in patients..." entry is there.
+4. **2-day reminders.** Book an appointment for the test patient between 36 and 48 hours from
+   now (so the 2-day reminders are already due). Reminders only go out during sending hours
+   (08:00 to 20:00 in the practice timezone); to test outside them, temporarily set sending
+   hours to `00:00`–`23:59` and restore them afterwards. Within 5 minutes (or restart the app
+   to run a pass at once), **Reminder activity** shows "Sent 1" or more, and the patient's
+   panel and the appointment show a text and an email as Sent.
+
+   Emails to SES's mailbox simulator **don't count** toward
+   `aws sesv2 get-account --query SendQuota.SentLast24Hours`. To see the count go up (and the
+   email arrive), give a test patient your own SES-verified address instead; in the SES
+   sandbox, recipients must be verified.
+5. **No repeats.** Restart the app; nothing new is sent for that appointment.
+6. **2-hour reminder.** Book an appointment about 1 hour 45 minutes ahead; one text is sent.
+   It's the patient's second text today, so it's held back by the one-per-day limit unless you
+   use a second test patient (for example with the failure simulator, `(425) 414-7167`).
+7. **Reschedule.** Move the appointment from step 4 to another time 36 to 48 hours ahead; new
+   reminders go out for the new time.
+8. **Skips.** Give a test patient the number `555-0123` and book them; the text shows as
+   Skipped with "not a valid phone number", and the email is still sent.
+9. **Audit.** Each send appears in the Audit tab as **LibreDental (automatic)** with
+   `system:reminders`.
+10. **Turn off.** Turn reminders off and book another appointment in the window; nothing is
+    sent. The audit log records turning them off.
+11. **Server mode.** Repeat steps 3 to 5 with `task server` at `http://localhost:4242`.
 
 ### PR 4: Optional Terraform module
 
@@ -717,13 +1140,20 @@ Use a personal AWS account for development, with these rules:
 
 ## Open questions
 
-- Which reminder rules ship by default (for example 48 hours by SMS and email, 2 hours by
-  SMS)?
-- Should templates be per-language, using the patient's `preferred_language`?
-- Should reminders respect `preferred_contact_method`, or send on every channel the practice
-  enables?
+Default rules, language, and channel choice were decided on 2026-10-06 (see
+[Decisions for PR 3](#decisions-for-pr-3)). Still open:
+
 - Two-way replies ("reply C to confirm") through SNS to SQS polling: in scope for a later
   phase?
+- Per-language templates using `preferred_language`, once the frontend has more locales.
+- Rules with other timings, beyond turning the defaults on and off.
+- Retrying failures caused by configuration rather than the recipient (provider sign-in
+  rejected, server unreachable) on later passes until the reminder's window closes, while
+  keeping recipient failures (address or number rejected) final. Today any failure is final,
+  so a mistyped password drops every reminder that comes due until it's fixed. Retries would
+  need to avoid flooding the audit log with repeated attempts.
+- Whether sending hours should apply only to texts (they come from US texting rules), so
+  emails can go out whenever the app is running.
 
 ## References
 
