@@ -22,6 +22,7 @@
     CountryConfig,
     Appointment,
     Provider,
+    LoginProvider,
     Operatory,
   } from "@bindings/domain/index.js";
   import { Sex, Status, AppointmentStatus } from "@bindings/domain/index.js";
@@ -110,7 +111,10 @@
   }
 
   // Clinic providers and operatories state
+  // `providers` holds full staff records and is only loaded with a session; the login screen
+  // uses `loginProviders`, which carries names and roles only.
   let providers = $state<Provider[]>([]);
+  let loginProviders = $state<LoginProvider[]>([]);
   let operatories = $state<Operatory[]>([]);
 
   // Patients state: `patients` backs the Patients tab and follows its search/status filter;
@@ -292,10 +296,26 @@
     showStaffLoginModal = true;
   }
 
-  async function loadClinicData() {
+  async function loadProviders() {
+    const token = auth.token;
+    if (!token) {
+      providers = [];
+      return;
+    }
     try {
-      const provList = await PracticeConfigService.ListProviders();
+      const provList = await PracticeConfigService.ListProviders(token);
+      if (auth.token !== token) return;
       providers = (provList?.filter(Boolean) as Provider[]) || [];
+    } catch (err) {
+      console.error("Failed to load clinic providers:", err);
+    }
+  }
+
+  async function loadClinicData() {
+    await loadProviders();
+    try {
+      const loginList = await PracticeConfigService.ListLoginProviders();
+      loginProviders = (loginList?.filter(Boolean) as LoginProvider[]) || [];
 
       const opList = await PracticeConfigService.ListOperatories();
       operatories = (opList?.filter(Boolean) as Operatory[]) || [];
@@ -779,6 +799,7 @@
         loadingPatients = false;
         loadingAppointments = false;
         loadedToken = "";
+        providers = [];
         patients = [];
         directoryPatients = [];
         appointments = [];
@@ -786,6 +807,7 @@
       }
       if (token !== loadedToken) {
         loadedToken = token;
+        loadProviders();
         refreshPatientLists();
       }
       loadAppointments();
@@ -879,7 +901,7 @@
 
 <StaffLoginModal
   bind:showModal={showStaffLoginModal}
-  {providers}
+  providers={loginProviders}
   onlogout={() => (activeTab = "clinic")}
 />
 
