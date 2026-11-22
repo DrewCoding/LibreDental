@@ -87,6 +87,16 @@ type Provider struct {
 	UpdatedAt  time.Time `json:"updated_at"`
 }
 
+// LoginProvider is the subset of a Provider shown on the staff login screen. It is the only
+// provider data served without a session, so it must stay free of contact, pay, licensing
+// and clock-in details.
+type LoginProvider struct {
+	ID    string       `json:"id"`
+	Name  string       `json:"name"`
+	Role  ProviderRole `json:"role"`
+	Color string       `json:"color"`
+}
+
 type OperatoryType string
 
 const (

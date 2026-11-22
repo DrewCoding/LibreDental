@@ -1,8 +1,10 @@
 package services_test
 
 import (
+	"encoding/json"
 	"errors"
 	"path/filepath"
+	"sort"
 	"strings"
 	"testing"
 
@@ -106,7 +108,7 @@ func TestPracticeConfigService(t *testing.T) {
 		t.Errorf("Expected generated provider ID")
 	}
 
-	providers, err := service.ListProviders()
+	providers, err := service.ListProviders("")
 	if err != nil {
 		t.Fatalf("Failed to list providers: %v", err)
 	}
@@ -137,7 +139,7 @@ func TestPracticeConfigService(t *testing.T) {
 		t.Fatalf("Failed to delete provider: %v", err)
 	}
 
-	providersAfterDelete, err := service.ListProviders()
+	providersAfterDelete, err := service.ListProviders("")
 	if err != nil {
 		t.Fatalf("Failed to list providers after delete: %v", err)
 	}
@@ -406,7 +408,7 @@ func TestPracticeConfigService_RejectsReservedProviderIDs(t *testing.T) {
 		}
 	}
 
-	providers, err := service.ListProviders()
+	providers, err := service.ListProviders(token)
 	if err != nil {
 		t.Fatalf("Failed to list providers: %v", err)
 	}
@@ -484,11 +486,99 @@ func TestPracticeConfigService_NewProvidersDoNotOverwriteEachOther(t *testing.T)
 		}
 	}
 
-	providers, err := service.ListProviders()
+	providers, err := service.ListProviders(token)
 	if err != nil {
 		t.Fatalf("ListProviders failed: %v", err)
 	}
 	if len(providers) != extra+1 {
 		t.Fatalf("Expected %d providers, got %d", extra+1, len(providers))
+	}
+}
+
+// In LAN server mode any client on the network can call these methods, so the full staff
+// list (contact, pay, licensing) needs a session and the login screen gets only names.
+func TestPracticeConfigService_StaffDetailsRequireSession(t *testing.T) {
+	tempDir := t.TempDir()
+
+	db, err := sqlite.Open(filepath.Join(tempDir, "main.db"))
+	if err != nil {
+		t.Fatalf("Failed to open sqlite db: %v", err)
+	}
+	defer db.Close()
+
+	auditDb, err := sqlite.OpenAudit(filepath.Join(tempDir, "audit.db"))
+	if err != nil {
+		t.Fatalf("Failed to open audit sqlite db: %v", err)
+	}
+	defer auditDb.Close()
+
+	repo := sqlite.NewPracticeConfigRepository(db)
+	auditService := services.NewAuditService(sqlite.NewAuditRepository(auditDb), repo)
+	service := services.NewPracticeConfigService(repo, auditService)
+
+	if _, err := service.SetConfig("", "US"); err != nil {
+		t.Fatalf("SetConfig failed: %v", err)
+	}
+	token, err := service.CreateInitialProvider(domain.Provider{Name: "Dr. Owner", Pin: "1234", Color: "#112233", IsActive: true})
+	if err != nil {
+		t.Fatalf("CreateInitialProvider failed: %v", err)
+	}
+	staff, err := service.SaveProvider(token, domain.Provider{
+		Name: "Pat Hygienist", Role: domain.RoleHygienist, Pin: "5678", IsActive: true,
+		Email: "pat@example.test", Phone: "555-0100", LicenseNumber: "RDH-1", HourlyRate: 4250,
+	})
+	if err != nil {
+		t.Fatalf("SaveProvider failed: %v", err)
+	}
+	former, err := service.SaveProvider(token, domain.Provider{Name: "Former Staff", Pin: "9999", IsActive: true})
+	if err != nil {
+		t.Fatalf("SaveProvider failed: %v", err)
+	}
+	if err := service.DeleteProvider(token, former.ID); err != nil {
+		t.Fatalf("DeleteProvider failed: %v", err)
+	}
+
+	for _, bad := range []string{"", "unknown-token"} {
+		if _, err := service.ListProviders(bad); !errors.Is(err, services.ErrUnauthorized) {
+			t.Errorf("Expected ListProviders with token %q to be unauthorized, got %v", bad, err)
+		}
+	}
+	full, err := service.ListProviders(token)
+	if err != nil || len(full) != 3 {
+		t.Fatalf("Expected 3 providers with a session, got %d, %v", len(full), err)
+	}
+
+	login, err := service.ListLoginProviders()
+	if err != nil {
+		t.Fatalf("ListLoginProviders failed: %v", err)
+	}
+	if len(login) != 2 {
+		t.Fatalf("Expected only the 2 active providers on the login screen, got %d", len(login))
+	}
+	for _, p := range login {
+		if p.ID == former.ID {
+			t.Errorf("Deactivated provider %q listed on the login screen", p.Name)
+		}
+		if p.ID == staff.ID && (p.Name != "Pat Hygienist" || p.Role != domain.RoleHygienist) {
+			t.Errorf("Login entry for staff lost name or role: %+v", p)
+		}
+	}
+
+	// Guard the wire format, so a field added to LoginProvider later can't leak unnoticed.
+	raw, err := json.Marshal(login[0])
+	if err != nil {
+		t.Fatalf("Failed to marshal login provider: %v", err)
+	}
+	var fields map[string]any
+	if err := json.Unmarshal(raw, &fields); err != nil {
+		t.Fatalf("Failed to unmarshal login provider: %v", err)
+	}
+	keys := make([]string, 0, len(fields))
+	for k := range fields {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	if got := strings.Join(keys, ","); got != "color,id,name,role" {
+		t.Errorf("Login provider exposes unexpected fields: %s", got)
 	}
 }

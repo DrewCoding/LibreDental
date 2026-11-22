@@ -143,8 +143,6 @@ var (
 	ErrPinIncorrect     = errors.New("incorrect pin")
 )
 
-// ListProviders fetches all configured clinic providers and staff.
-
 // VerifyProviderPin checks a provider's pin and returns the redacted provider.
 func (s *PracticeConfigService) VerifyProviderPin(id string, pin string) (*domain.Provider, error) {
 	providers, err := s.repo.ListProviders(context.Background())
@@ -189,7 +187,12 @@ func (s *PracticeConfigService) GetProviderPin(token string, id string) (string,
 	return "", storage.ErrNotFound
 }
 
-func (s *PracticeConfigService) ListProviders() ([]*domain.Provider, error) {
+// ListProviders fetches all configured clinic providers and staff, including contact, pay
+// and licensing details, so it requires a session. The login screen uses ListLoginProviders.
+func (s *PracticeConfigService) ListProviders(token string) ([]*domain.Provider, error) {
+	if err := s.requireSession(token); err != nil {
+		return nil, err
+	}
 	providers, err := s.repo.ListProviders(context.Background())
 	if err != nil {
 		return nil, err
@@ -198,6 +201,23 @@ func (s *PracticeConfigService) ListProviders() ([]*domain.Provider, error) {
 		p.Pin = "****"
 	}
 	return providers, nil
+}
+
+// ListLoginProviders returns the active providers for the staff login screen. It needs no
+// session, because nobody is logged in yet, so it returns only what that screen displays.
+func (s *PracticeConfigService) ListLoginProviders() ([]*domain.LoginProvider, error) {
+	providers, err := s.repo.ListProviders(context.Background())
+	if err != nil {
+		return nil, err
+	}
+	login := []*domain.LoginProvider{}
+	for _, p := range providers {
+		if !p.IsActive {
+			continue
+		}
+		login = append(login, &domain.LoginProvider{ID: p.ID, Name: p.Name, Role: p.Role, Color: p.Color})
+	}
+	return login, nil
 }
 
 // NeedsInitialProvider reports whether first-run onboarding still has to create the
