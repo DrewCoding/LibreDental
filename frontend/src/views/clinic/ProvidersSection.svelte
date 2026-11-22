@@ -144,7 +144,7 @@
     for (const p of provs) {
       const gen = (providerGen[p.id] = (providerGen[p.id] || 0) + 1);
       try {
-        const tc = await TimecardService.GetActiveTimecard(p.id);
+        const tc = await TimecardService.GetActiveTimecard(auth.token, p.id);
         if (providerGen[p.id] === gen) {
           activeTimecards[p.id] = tc;
         }
@@ -242,7 +242,9 @@
     </div>
   </div>
 
-  {#if providers.length === 0}
+  {#if !auth.token}
+    <EmptyState title={m.staff_signin_required_title()} subtitle={m.staff_signin_required_sub()} />
+  {:else if providers.length === 0}
     <EmptyState title={m.prov_empty_title()} subtitle={m.prov_empty_sub()} />
   {:else if filteredProviders.length === 0}
     <EmptyState title={m.prov_no_results_title()} subtitle={m.prov_no_results_desc()} />

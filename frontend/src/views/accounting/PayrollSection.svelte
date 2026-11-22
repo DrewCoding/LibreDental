@@ -33,7 +33,7 @@
     for (const p of provs) {
       const gen = (providerGen[p.id] = (providerGen[p.id] || 0) + 1);
       try {
-        const owed = await TimecardService.GetTotalOwed(p.id);
+        const owed = await TimecardService.GetTotalOwed(auth.token, p.id);
         if (providerGen[p.id] === gen) {
           totalOwed[p.id] = owed;
         }
@@ -68,7 +68,12 @@
 </script>
 
 <div class="space-y-4">
-  {#if providers.length === 0}
+  {#if !auth.token}
+    <EmptyState
+      title={m.payroll_signin_required_title()}
+      subtitle={m.payroll_signin_required_sub()}
+    />
+  {:else if providers.length === 0}
     <EmptyState title={m.prov_empty_title()} subtitle={m.prov_empty_sub()} />
   {:else}
     <div class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
