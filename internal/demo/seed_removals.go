@@ -173,7 +173,7 @@ func seedRemovals(g *ServiceGraph, token string, rng *rand.Rand, h *historyState
 		if err := g.Timecard.CreateManualTimecard(token, id, 480, stamp.Format(time.RFC3339)); err != nil {
 			return fmt.Errorf("failed to seed timecard for %s: %w", id, err)
 		}
-		cards, err := g.Timecard.ListTimecards(id, stamp.Format(time.RFC3339), stamp.Format(time.RFC3339))
+		cards, err := g.Timecard.ListTimecards(token, id, stamp.Format(time.RFC3339), stamp.Format(time.RFC3339))
 		if err != nil {
 			return fmt.Errorf("failed to find mistaken timecard for %s: %w", id, err)
 		}

@@ -1,5 +1,5 @@
 <script lang="ts">
-  import type { Provider } from "@bindings/domain/models.js";
+  import type { LoginProvider } from "@bindings/domain/models.js";
   import Modal from "../ui/Modal.svelte";
   import { auth } from "../../stores/auth.svelte.js";
   import { m } from "../../paraglide/messages.js";
@@ -13,16 +13,16 @@
     onlogout,
   }: {
     showModal: boolean;
-    providers: Provider[];
+    providers: LoginProvider[];
     onlogout?: () => void;
   } = $props();
 
-  let selectedProvider = $state<Provider | null>(null);
+  let selectedProvider = $state<LoginProvider | null>(null);
   let pinInput = $state("");
   let errorMsg = $state("");
   let isLoggingIn = $state(false);
 
-  function selectProvider(p: Provider) {
+  function selectProvider(p: LoginProvider) {
     selectedProvider = p;
     pinInput = "";
     errorMsg = "";
@@ -113,7 +113,7 @@
 
   {#if !selectedProvider}
     <div class="grid grid-cols-1 gap-2 max-h-[400px] overflow-y-auto pr-2 custom-scrollbar">
-      {#each providers.filter((p: Provider) => p.is_active) as p}
+      {#each providers as p}
         <button
           type="button"
           onclick={() => selectProvider(p)}
@@ -131,7 +131,7 @@
           </div>
         </button>
       {/each}
-      {#if providers.filter((p: Provider) => p.is_active).length === 0}
+      {#if providers.length === 0}
         <p class="text-slate-400 text-sm text-center py-4">{m.staff_login_no_providers()}</p>
       {/if}
     </div>

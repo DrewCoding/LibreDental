@@ -61,18 +61,18 @@ func TestTimecardService_ValidationAndErrors(t *testing.T) {
 	})
 
 	t.Run("ListTimecards invalid date parsing", func(t *testing.T) {
-		_, err := service.ListTimecards("prov_svc_1", "invalid-date", "")
+		_, err := service.ListTimecards("", "prov_svc_1", "invalid-date", "")
 		if err == nil {
 			t.Errorf("Expected error for invalid start date, got nil")
 		}
 
-		_, err = service.ListTimecards("prov_svc_1", "", "invalid-date")
+		_, err = service.ListTimecards("", "prov_svc_1", "", "invalid-date")
 		if err == nil {
 			t.Errorf("Expected error for invalid end date, got nil")
 		}
 
 		validDate := time.Now().Format(time.RFC3339)
-		list, err := service.ListTimecards("prov_svc_1", validDate, validDate)
+		list, err := service.ListTimecards("", "prov_svc_1", validDate, validDate)
 		if err != nil {
 			t.Errorf("Expected success for valid dates, got %v", err)
 		}
@@ -156,5 +156,65 @@ func TestTimecardService_ClockRequiresSession(t *testing.T) {
 	}
 	if _, err := service.ClockOut(token, "prov_clock"); err != nil {
 		t.Fatalf("Expected ClockOut with session to succeed, got %v", err)
+	}
+}
+
+// Timecards show pay, hours and who is on site right now, so reading them needs a session,
+// as in LAN server mode any client on the network can call these methods.
+func TestTimecardService_ReadsRequireSession(t *testing.T) {
+	tempDir := t.TempDir()
+
+	db, err := sqlite.Open(filepath.Join(tempDir, "main.db"))
+	if err != nil {
+		t.Fatalf("Failed to open sqlite db: %v", err)
+	}
+	defer db.Close()
+
+	auditDb, err := sqlite.OpenAudit(filepath.Join(tempDir, "audit.db"))
+	if err != nil {
+		t.Fatalf("Failed to open audit sqlite db: %v", err)
+	}
+	defer auditDb.Close()
+
+	configRepo := sqlite.NewPracticeConfigRepository(db)
+	auditService := services.NewAuditService(sqlite.NewAuditRepository(auditDb), configRepo)
+	service := services.NewTimecardService(sqlite.NewTimecardRepository(db), configRepo, auditService)
+
+	if err := configRepo.SaveProvider(context.Background(), &domain.Provider{
+		ID: "prov_pay", Name: "Dr. Pay", Role: domain.RoleDentist, Pin: "1234", HourlyRate: 4250, IsActive: true,
+	}); err != nil {
+		t.Fatalf("Failed to save provider: %v", err)
+	}
+	token, err := auditService.CreateSession("prov_pay", "1234")
+	if err != nil {
+		t.Fatalf("Failed to create session: %v", err)
+	}
+	if err := service.CreateManualTimecard(token, "prov_pay", 480, time.Now().Format(time.RFC3339)); err != nil {
+		t.Fatalf("Failed to create timecard: %v", err)
+	}
+	if _, err := service.ClockIn(token, "prov_pay"); err != nil {
+		t.Fatalf("Failed to clock in: %v", err)
+	}
+
+	for _, bad := range []string{"", "unknown-token"} {
+		if _, err := service.ListTimecards(bad, "all", "", ""); !errors.Is(err, services.ErrUnauthorized) {
+			t.Errorf("Expected ListTimecards with token %q to be unauthorized, got %v", bad, err)
+		}
+		if _, err := service.GetActiveTimecard(bad, "prov_pay"); !errors.Is(err, services.ErrUnauthorized) {
+			t.Errorf("Expected GetActiveTimecard with token %q to be unauthorized, got %v", bad, err)
+		}
+		if _, err := service.GetTotalOwed(bad, "prov_pay"); !errors.Is(err, services.ErrUnauthorized) {
+			t.Errorf("Expected GetTotalOwed with token %q to be unauthorized, got %v", bad, err)
+		}
+	}
+
+	if list, err := service.ListTimecards(token, "all", "", ""); err != nil || len(list) != 2 {
+		t.Errorf("Expected 2 timecards with a session, got %d, %v", len(list), err)
+	}
+	if tc, err := service.GetActiveTimecard(token, "prov_pay"); err != nil || tc == nil {
+		t.Errorf("Expected an active timecard with a session, got %v, %v", tc, err)
+	}
+	if owed, err := service.GetTotalOwed(token, "prov_pay"); err != nil || owed != 34000 {
+		t.Errorf("Expected 34000 cents owed with a session, got %d, %v", owed, err)
 	}
 }

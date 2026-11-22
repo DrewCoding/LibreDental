@@ -67,7 +67,7 @@
       if (filterEndDate) {
         end = new Date(filterEndDate + "T23:59:59.999").toISOString();
       }
-      const results = await TimecardService.ListTimecards(providerId, start, end);
+      const results = await TimecardService.ListTimecards(auth.token, providerId, start, end);
       if (gen === requestGen) {
         timecards = results ? (results.filter(Boolean) as Timecard[]) : [];
       }

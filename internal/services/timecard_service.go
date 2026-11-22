@@ -119,8 +119,12 @@ func (s *TimecardService) ClockOut(token string, providerID string) (*domain.Tim
 	return active, nil
 }
 
-// GetActiveTimecard returns the active timecard if the provider is clocked in.
-func (s *TimecardService) GetActiveTimecard(providerID string) (*domain.Timecard, error) {
+// GetActiveTimecard returns the active timecard if the provider is clocked in. It reveals
+// who is on site right now, so it requires a session like the other payroll reads.
+func (s *TimecardService) GetActiveTimecard(token string, providerID string) (*domain.Timecard, error) {
+	if s.auditService != nil && s.auditService.GetSessionUser(token) == nil {
+		return nil, ErrUnauthorized
+	}
 	ctx := context.Background()
 	tc, err := s.timecardRepo.GetActiveTimecard(ctx, providerID)
 	if err != nil {
@@ -133,7 +137,10 @@ func (s *TimecardService) GetActiveTimecard(providerID string) (*domain.Timecard
 }
 
 // ListTimecards returns timecards for a specific provider or all providers if "all" is passed.
-func (s *TimecardService) ListTimecards(providerID string, startDateStr string, endDateStr string) ([]*domain.Timecard, error) {
+func (s *TimecardService) ListTimecards(token string, providerID string, startDateStr string, endDateStr string) ([]*domain.Timecard, error) {
+	if s.auditService != nil && s.auditService.GetSessionUser(token) == nil {
+		return nil, ErrUnauthorized
+	}
 	ctx := context.Background()
 
 	var startDate *time.Time
@@ -235,7 +242,10 @@ func (s *TimecardService) CreateManualTimecard(token string, providerID string, 
 }
 
 // GetTotalOwed returns the total unpaid amount owed to a provider.
-func (s *TimecardService) GetTotalOwed(providerID string) (int64, error) {
+func (s *TimecardService) GetTotalOwed(token string, providerID string) (int64, error) {
+	if s.auditService != nil && s.auditService.GetSessionUser(token) == nil {
+		return 0, ErrUnauthorized
+	}
 	ctx := context.Background()
 	return s.timecardRepo.GetTotalOwed(ctx, providerID)
 }
